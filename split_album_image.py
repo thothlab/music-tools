@@ -40,6 +40,8 @@ COVER_POSITIVE_KEYWORDS = (("front", 100), ("cover", 90), ("folder", 85), ("albu
 COVER_NEGATIVE_KEYWORDS = (
     "back", "rear", "booklet", "matrix", "tray", "inlay", "spine", "obi", "sticker",
 )
+# Matches per-disc subfolder names like "CD1", "CD 1", "Disc 2", "Disk-3".
+DISC_DIR_RE = re.compile(r"^(?:cd|disc|disk|disco)[\s._-]*\d+", re.IGNORECASE)
 DEFAULT_APPLE_OUTPUT_ROOT = "/Volumes/PHOTOS/Музыка-Apple"
 APPLE_ALAC_SAMPLE_RATE = "96000"
 APPLE_ALAC_SAMPLE_FMT = "s32"
@@ -443,7 +445,22 @@ def find_cover_art(folder: Path, disc_hint: str | None = None) -> Path | None:
     like ``front CD1.jpg`` are recognised. When ``disc_hint`` is given (e.g.
     ``"CD1"``), images whose name carries the matching disc token win over the
     generic release cover.
+
+    Multi-disc boxes keep their covers in the album root (loose ``Cover.jpg`` /
+    ``front.png`` or a ``Covers/`` subfolder) rather than inside each ``CD 1`` /
+    ``CD 2`` disc folder, so when nothing matches inside ``folder`` the search
+    falls back one level up to the parent.
     """
+    found = _find_cover_in(folder, disc_hint)
+    if found:
+        return found
+    parent = folder.parent
+    if parent != folder:
+        return _find_cover_in(parent, disc_hint)
+    return None
+
+
+def _find_cover_in(folder: Path, disc_hint: str | None) -> Path | None:
     candidates = _collect_cover_candidates(folder)
     if not candidates:
         return None
@@ -967,6 +984,25 @@ def process_cue(
     return output_dir
 
 
+def is_disc_dir(folder: Path) -> bool:
+    """True if the folder name looks like a per-disc subfolder (CD 1, Disc 2, ...)."""
+    return bool(DISC_DIR_RE.match(folder.name.strip()))
+
+
+def artwork_source_and_dest(input_dir: Path, output_dir: Path, *, preserve: bool) -> tuple[Path, Path]:
+    """Where to read artwork from and which release dir to copy it into.
+
+    For a per-disc subfolder (``CD 1``/``CD 2``/...), covers usually live one
+    level up in the album root (loose images or a ``Covers/`` folder) and the
+    release output is the parent of the per-disc output, so read from and write
+    to the album level. Otherwise use the folder itself.
+    """
+    if is_disc_dir(input_dir):
+        dest = output_dir.parent if preserve else output_dir
+        return input_dir.parent, dest
+    return input_dir, output_dir
+
+
 def copy_artwork(src_folder: Path, dest_dir: Path, *, dry_run: bool, force: bool) -> None:
     """Consolidate artwork images into a single ``Covers/`` folder in the output.
 
@@ -1038,10 +1074,12 @@ def main() -> None:
             output_root = choose_output_root(input_dir, args.output_root)
             source_root = Path(args.source_root).expanduser().resolve()
             base = build_preserved_output_dir(output_root, source_root, input_dir)
-            copy_artwork(input_dir, base, dry_run=args.dry_run, force=args.force)
+            src, dest = artwork_source_and_dest(input_dir, base, preserve=True)
+            copy_artwork(src, dest, dry_run=args.dry_run, force=args.force)
         else:
-            for dest in dict.fromkeys(produced_dirs):
-                copy_artwork(input_dir, dest, dry_run=args.dry_run, force=args.force)
+            for dest0 in dict.fromkeys(produced_dirs):
+                src, dest = artwork_source_and_dest(input_dir, dest0, preserve=False)
+                copy_artwork(src, dest, dry_run=args.dry_run, force=args.force)
 
     if failures:
         raise SystemExit(1)

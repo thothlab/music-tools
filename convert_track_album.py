@@ -15,11 +15,14 @@ from split_album_image import (
     apple_alac_cap_filter_args,
     build_output_dir,
     build_preserved_output_dir,
+    artwork_source_and_dest,
     choose_output_root,
     clean_whitespace,
     codec_settings,
+    copy_artwork,
     dedupe_keep_order,
     find_cover_art,
+    is_disc_dir,
     normalize_album_artist,
     run_ffmpeg_with_progress,
     sanitize_part,
@@ -56,6 +59,11 @@ def parse_args() -> argparse.Namespace:
         help="Preserve source directory structure under the output root instead of rebuilding artist/album folders",
     )
     parser.add_argument("--apple-library", action="store_true")
+    parser.add_argument(
+        "--copy-artwork",
+        action="store_true",
+        help="Copy artwork dirs and loose cover images into the release output Covers/ folder",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--force", action="store_true")
     return parser.parse_args()
@@ -268,7 +276,8 @@ def main() -> None:
         output_dir = build_preserved_output_dir(output_root, source_root, input_dir)
     else:
         output_dir = build_output_dir(output_root, album_artist, year, album_title)
-    sidecar_cover = find_cover_art(input_dir)
+    disc_hint = input_dir.name if is_disc_dir(input_dir) else None
+    sidecar_cover = find_cover_art(input_dir, disc_hint=disc_hint)
     ext, _codec_args = codec_settings(args.format)
 
     print(f"SOURCE DIR: {input_dir}")
@@ -324,6 +333,12 @@ def main() -> None:
                 f"ffmpeg failed for {source_path.name}",
                 details=result.stderr.strip() or result.stdout.strip(),
             )
+
+    if args.copy_artwork:
+        art_src, art_dest = artwork_source_and_dest(
+            input_dir, output_dir, preserve=args.preserve_structure
+        )
+        copy_artwork(art_src, art_dest, dry_run=args.dry_run, force=args.force)
 
     print("\nDone.")
 

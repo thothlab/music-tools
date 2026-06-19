@@ -217,6 +217,8 @@ def main() -> None:
                 cmd.append("--dry-run")
             if args.force:
                 cmd.append("--force")
+            if args.copy_artwork:
+                cmd.append("--copy-artwork")
 
             print(f"\n[TRACK {idx}/{len(track_dirs)}] {folder}")
             print(shell_preview(cmd))
