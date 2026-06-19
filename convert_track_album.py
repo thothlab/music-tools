@@ -21,8 +21,10 @@ from split_album_image import (
     dedupe_keep_order,
     find_cover_art,
     normalize_album_artist,
+    run_ffmpeg_with_progress,
     sanitize_part,
     shell_preview,
+    strip_redundant_track_prefix,
 )
 
 
@@ -65,7 +67,7 @@ def probe_file(path: Path) -> dict:
         "-v",
         "error",
         "-show_entries",
-        "format=format_name:format_tags:stream=index,codec_type,codec_name,disposition,sample_rate,bits_per_raw_sample,bits_per_sample,sample_fmt:stream_tags",
+        "format=format_name,duration,format_tags:stream=index,codec_type,codec_name,disposition,sample_rate,bits_per_raw_sample,bits_per_sample,sample_fmt,duration:stream_tags",
         "-of",
         "json",
         str(path),
@@ -125,6 +127,25 @@ def audio_codec_name(data: dict) -> str:
     return ""
 
 
+def audio_duration(data: dict) -> float:
+    fmt = data.get("format") or {}
+    try:
+        value = float(fmt.get("duration") or 0.0)
+        if value > 0:
+            return value
+    except (TypeError, ValueError):
+        pass
+    for stream in data.get("streams") or []:
+        if stream.get("codec_type") == "audio":
+            try:
+                value = float(stream.get("duration") or 0.0)
+                if value > 0:
+                    return value
+            except (TypeError, ValueError):
+                continue
+    return 0.0
+
+
 def audio_properties(data: dict) -> tuple[int, int]:
     for stream in data.get("streams") or []:
         if stream.get("codec_type") == "audio":
@@ -150,10 +171,12 @@ def build_album_context(folder: Path, first_tags: dict[str, str]) -> tuple[str, 
 def build_track_context(path: Path, tags: dict[str, str], fallback_index: int, album_artist: str) -> dict[str, str]:
     number, _ = parse_track_number(tags.get("track") or tags.get("tracknumber") or "")
     disc, _ = parse_track_number(tags.get("disc") or tags.get("discnumber") or "")
-    title = clean_whitespace(tags.get("title") or path.stem)
+    effective_number = number or fallback_index
+    raw_title = tags.get("title") or path.stem
+    title = clean_whitespace(strip_redundant_track_prefix(raw_title, effective_number))
     artist = clean_whitespace(tags.get("artist") or album_artist)
     return {
-        "track": str(number or fallback_index),
+        "track": str(effective_number),
         "disc": str(disc or 1),
         "title": title,
         "artist": artist,
@@ -166,7 +189,8 @@ def format_output_filename(track_number: str, title: str, ext: str) -> str:
     except ValueError:
         number = 0
     prefix = f"{number:02d}" if number > 0 else "00"
-    return f"{prefix} - {sanitize_part(title)}{ext}"
+    cleaned = strip_redundant_track_prefix(title, number)
+    return f"{prefix} - {sanitize_part(cleaned)}{ext}"
 
 
 def build_ffmpeg_command(
@@ -292,7 +316,9 @@ def main() -> None:
             print(f"  CMD: {shell_preview(cmd)}")
             continue
 
-        result = run(cmd)
+        duration = audio_duration(probe)
+        label = f"[{idx:02d}] {track_meta['title']}"
+        result = run_ffmpeg_with_progress(cmd, duration, label)
         if result.returncode != 0:
             fail(
                 f"ffmpeg failed for {source_path.name}",

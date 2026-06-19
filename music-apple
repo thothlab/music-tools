@@ -9,9 +9,16 @@ while [ -L "$SOURCE_PATH" ]; do
 done
 
 SCRIPT_DIR="$(cd "$(dirname "$SOURCE_PATH")" && pwd)"
-ROOT_DIR="${1:-$PWD}"
+
+if [ $# -gt 0 ] && [[ "$1" != -* ]]; then
+  ROOT_DIR="$1"
+  shift
+else
+  ROOT_DIR="$PWD"
+fi
 
 exec python3 "$SCRIPT_DIR/batch_split_cues.py" \
   --root "$ROOT_DIR" \
   --apple-library \
-  --copy-non-cue-alac
+  --copy-non-cue-alac \
+  "$@"

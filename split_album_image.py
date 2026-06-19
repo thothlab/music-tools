@@ -7,8 +7,11 @@ import json
 import os
 import re
 import shlex
+import shutil
+import signal
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
@@ -24,7 +27,14 @@ SUPPORTED_AUDIO_EXTS = {
     ".aif",
     ".alac",
 }
-SUPPORTED_COVER_NAMES = ("cover.jpg", "cover.png", "folder.jpg", "folder.png")
+COVER_EXTS = (".jpg", ".jpeg", ".png")
+COVER_SUBDIRS = ("scan", "scans", "cover", "covers", "artwork", "art", "front")
+# Filename keywords that mark a front-cover candidate, strongest first.
+COVER_POSITIVE_KEYWORDS = (("front", 100), ("cover", 90), ("folder", 85), ("album", 80))
+# Keywords that mark a non-front scan (back, booklet pages, disc matrix, etc.).
+COVER_NEGATIVE_KEYWORDS = (
+    "back", "rear", "booklet", "matrix", "tray", "inlay", "spine", "obi", "sticker",
+)
 DEFAULT_APPLE_OUTPUT_ROOT = "/Volumes/PHOTOS/Музыка-Apple"
 APPLE_ALAC_SAMPLE_RATE = "96000"
 APPLE_ALAC_SAMPLE_FMT = "s32"
@@ -40,6 +50,7 @@ class Track:
     index_01: str | None = None
     start_seconds: float | None = None
     end_seconds: float | None = None
+    file_name: str | None = None
 
 
 @dataclass
@@ -55,6 +66,93 @@ class CueSheet:
 
 def run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(cmd, text=True, capture_output=True, check=False)
+
+
+def _format_mmss(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+_BAR_BLOCKS = " ▏▎▍▌▋▊▉█"
+
+
+def _render_progress(label: str, cur: float, total: float) -> None:
+    width = shutil.get_terminal_size((80, 24)).columns
+    ratio = 0.0 if total <= 0 else min(1.0, max(0.0, cur / total))
+    pct = f"{int(ratio * 100):3d}%"
+    timing = f"{_format_mmss(cur)}/{_format_mmss(total)}"
+    suffix = f" {pct} {timing}"
+    prefix = f"  {label} "
+    bar_width = max(10, width - len(prefix) - len(suffix) - 1)
+    total_eighths = int(round(bar_width * 8 * ratio))
+    full = total_eighths // 8
+    remainder = total_eighths % 8
+    filled_part = "█" * full
+    partial = _BAR_BLOCKS[remainder] if remainder and full < bar_width else ""
+    empty_count = bar_width - full - (1 if partial else 0)
+    bar = filled_part + partial + "░" * max(0, empty_count)
+    line = f"{prefix}{bar}{suffix}"
+    sys.stderr.write("\r" + line)
+    sys.stderr.flush()
+
+
+def run_ffmpeg_with_progress(
+    cmd: list[str],
+    expected_seconds: float,
+    label: str,
+) -> subprocess.CompletedProcess[str]:
+    is_tty = sys.stderr.isatty()
+    if not is_tty or expected_seconds <= 0:
+        return subprocess.run(cmd, text=True, capture_output=True, check=False)
+
+    full_cmd = cmd[:1] + ["-nostats", "-progress", "pipe:1"] + cmd[1:]
+    proc = subprocess.Popen(
+        full_cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    stderr_chunks: list[str] = []
+    last_render = 0.0
+    max_seconds = 0.0
+    try:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            line = line.strip()
+            if line.startswith("out_time_us=") or line.startswith("out_time_ms="):
+                try:
+                    raw = int(line.split("=", 1)[1])
+                except ValueError:
+                    continue
+                cur_seconds = raw / 1_000_000.0
+                if cur_seconds <= max_seconds:
+                    continue
+                max_seconds = cur_seconds
+                now = time.monotonic()
+                if now - last_render >= 0.1:
+                    _render_progress(label, cur_seconds, expected_seconds)
+                    last_render = now
+            elif line == "progress=end":
+                _render_progress(label, expected_seconds, expected_seconds)
+    except KeyboardInterrupt:
+        proc.send_signal(signal.SIGINT)
+        proc.wait()
+        sys.stderr.write("\n")
+        sys.stderr.flush()
+        raise
+    finally:
+        if proc.stderr is not None:
+            try:
+                stderr_chunks.append(proc.stderr.read())
+            except Exception:
+                pass
+        proc.wait()
+        sys.stderr.write("\n")
+        sys.stderr.flush()
+    return subprocess.CompletedProcess(
+        full_cmd, proc.returncode, stdout="", stderr="".join(stderr_chunks)
+    )
 
 
 def fail(message: str, *, details: str | None = None, code: int = 1) -> None:
@@ -119,6 +217,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Overwrite existing track files",
     )
+    parser.add_argument(
+        "--copy-artwork",
+        action="store_true",
+        help="Copy artwork dirs (Covers/Artwork/...) and loose images into the output, mirroring their source layout",
+    )
     return parser.parse_args()
 
 
@@ -137,12 +240,29 @@ def parse_mmssff(value: str) -> float:
     return minutes * 60 + seconds + (frames / 75.0)
 
 
+def read_cue_text(cue_path: Path) -> str:
+    """Decode a CUE sheet, tolerating the legacy encodings EAC/rippers emit.
+
+    Many CUEs are Windows-1252 rather than UTF-8 (e.g. byte 0x92 for a typographic
+    apostrophe in a FILE name). Reading them as UTF-8 mangles those bytes into
+    U+FFFD and the referenced audio file is never found, so try UTF-8 first and
+    fall back to cp1252, then latin-1 (which maps every byte).
+    """
+    raw = cue_path.read_bytes()
+    for encoding in ("utf-8-sig", "cp1252", "latin-1"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
 def parse_cue(cue_path: Path) -> CueSheet:
     cue = CueSheet()
     current_track: Track | None = None
     inside_track = False
 
-    for raw_line in cue_path.read_text(encoding="utf-8", errors="replace").splitlines():
+    for raw_line in read_cue_text(cue_path).splitlines():
         line = raw_line.strip()
         if not line:
             continue
@@ -168,7 +288,7 @@ def parse_cue(cue_path: Path) -> CueSheet:
             match = re.match(r"^TRACK\s+(\d+)\s+\S+$", line, flags=re.IGNORECASE)
             if not match:
                 fail(f"Could not parse TRACK line in {cue_path}", details=line)
-            current_track = Track(number=int(match.group(1)))
+            current_track = Track(number=int(match.group(1)), file_name=cue.file_name)
             cue.tracks.append(current_track)
             inside_track = True
             continue
@@ -205,12 +325,130 @@ def parse_cue(cue_path: Path) -> CueSheet:
     return cue
 
 
-def find_cover_art(folder: Path) -> Path | None:
-    for name in SUPPORTED_COVER_NAMES:
-        candidate = folder / name
-        if candidate.exists():
-            return candidate
+def _image_dimensions(path: Path) -> tuple[int, int] | None:
+    cmd = [
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=width,height", "-of", "csv=p=0", str(path),
+    ]
+    result = subprocess.run(cmd, text=True, capture_output=True, check=False)
+    if result.returncode != 0:
+        return None
+    parts = result.stdout.strip().split(",")
+    if len(parts) < 2:
+        return None
+    try:
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+
+
+_TOKEN_SPLIT_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _name_tokens(path: Path) -> set[str]:
+    return {t for t in _TOKEN_SPLIT_RE.split(path.stem.lower()) if t}
+
+
+def _cover_keyword_score(tokens: set[str]) -> int:
+    positive = 0
+    for keyword, value in COVER_POSITIVE_KEYWORDS:
+        if keyword in tokens:
+            positive = max(positive, value)
+    negative = 40 * sum(1 for keyword in COVER_NEGATIVE_KEYWORDS if keyword in tokens)
+    return positive - negative
+
+
+def _disc_tokens(disc_hint: str | None) -> set[str]:
+    """Filename tokens that identify a specific disc, e.g. 'CD1' -> {cd1, disc1, disk1}."""
+    if not disc_hint:
+        return set()
+    tokens = _name_tokens(Path(disc_hint))
+    tokens.add(re.sub(r"[^a-z0-9]+", "", disc_hint.lower()))
+    match = re.search(r"(\d+)$", disc_hint.lower())
+    if match:
+        n = int(match.group(1))
+        tokens.update({f"cd{n}", f"disc{n}", f"disk{n}"})
+    return {t for t in tokens if t}
+
+
+def _aspect_distance(path: Path) -> float:
+    dims = _image_dimensions(path)
+    if not dims or dims[1] <= 0:
+        return 99.0
+    return abs(dims[0] / dims[1] - 1.0)
+
+
+def _collect_cover_candidates(folder: Path) -> list[Path]:
+    candidates: list[Path] = []
+    try:
+        entries = list(folder.iterdir())
+    except OSError:
+        return []
+    for p in entries:
+        try:
+            if p.is_file() and p.suffix.lower() in COVER_EXTS:
+                candidates.append(p)
+            elif p.is_dir() and p.name.lower() in COVER_SUBDIRS:
+                try:
+                    sub_entries = list(p.iterdir())
+                except OSError:
+                    continue
+                candidates += [
+                    q for q in sub_entries if q.is_file() and q.suffix.lower() in COVER_EXTS
+                ]
+        except OSError:
+            continue
+    return candidates
+
+
+def find_cover_art(folder: Path, disc_hint: str | None = None) -> Path | None:
+    """Pick the best front-cover image for a release (or a specific disc).
+
+    Candidates are scored by filename keywords (front/cover/folder/album boost,
+    back/booklet/matrix/... penalty) rather than an exact stem match, so files
+    like ``front CD1.jpg`` are recognised. When ``disc_hint`` is given (e.g.
+    ``"CD1"``), images whose name carries the matching disc token win over the
+    generic release cover.
+    """
+    candidates = _collect_cover_candidates(folder)
+    if not candidates:
+        return None
+
+    disc_tokens = _disc_tokens(disc_hint)
+    scored = [(p, _cover_keyword_score(_name_tokens(p)), _name_tokens(p)) for p in candidates]
+
+    def best(pool: list[tuple[Path, int, set[str]]]) -> Path:
+        return sorted(pool, key=lambda it: (-it[1], _aspect_distance(it[0]), it[0].name.lower()))[0][0]
+
+    if disc_tokens:
+        disc_hits = [it for it in scored if it[1] > 0 and (disc_tokens & it[2])]
+        if disc_hits:
+            return best(disc_hits)
+
+    positives = [it for it in scored if it[1] > 0]
+    if positives:
+        return best(positives)
     return None
+
+
+def _cue_references_existing_audio(cue_path: Path) -> bool:
+    try:
+        text = read_cue_text(cue_path)
+    except OSError:
+        return False
+    folder = cue_path.parent
+    saw_file = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.upper().startswith("FILE "):
+            continue
+        match = re.match(r'^FILE\s+"?(.*?)"?\s+\S+$', stripped, flags=re.IGNORECASE)
+        if not match:
+            continue
+        saw_file = True
+        if not (folder / match.group(1)).exists():
+            return False
+    return saw_file
 
 
 def first_audio_file(folder: Path) -> Path | None:
@@ -219,7 +457,7 @@ def first_audio_file(folder: Path) -> Path | None:
     return candidates[0] if candidates else None
 
 
-def resolve_paths(args: argparse.Namespace) -> tuple[Path, Path, Path]:
+def resolve_input_dir(args: argparse.Namespace) -> Path:
     if args.input_dir:
         input_dir = Path(args.input_dir).expanduser().resolve()
     elif args.cue:
@@ -231,32 +469,75 @@ def resolve_paths(args: argparse.Namespace) -> tuple[Path, Path, Path]:
 
     if not input_dir.exists():
         fail(f"Input directory does not exist: {input_dir}")
+    return input_dir
 
+
+def select_cue_paths(args: argparse.Namespace, input_dir: Path) -> tuple[list[Path], bool]:
+    """Return (cue_paths, multi_disc).
+
+    multi_disc is True when the folder holds several disc images (each its own
+    cue+audio), in which case every playable cue is processed into its own
+    subfolder. Single-disc and "one real cue plus leftovers" cases keep the
+    original single-cue behaviour.
+    """
     if args.cue:
-        cue_path = Path(args.cue).expanduser().resolve()
-    else:
-        cues = sorted(input_dir.glob("*.cue"))
-        if len(cues) != 1:
-            fail(
-                f"Expected exactly one .cue in {input_dir}",
-                details=f"Found {len(cues)} cue files",
-            )
-        cue_path = cues[0]
+        return [Path(args.cue).expanduser().resolve()], False
 
-    cue = parse_cue(cue_path)
+    cues = sorted(input_dir.glob("*.cue"))
+    if not cues:
+        fail(f"Expected exactly one .cue in {input_dir}", details="Found 0 cue files")
+    if len(cues) == 1:
+        return [cues[0]], False
+
+    playable = [c for c in cues if _cue_references_existing_audio(c)]
+    if len(playable) == 1:
+        return [playable[0]], False
+    if len(playable) >= 2:
+        return playable, True
+    fail(
+        f"Expected exactly one .cue in {input_dir}",
+        details=(
+            f"Found {len(cues)} cue files; "
+            f"{len(playable)} reference audio present on disk"
+        ),
+    )
+
+
+def resolve_audio_for_cue(
+    args: argparse.Namespace, cue_path: Path, cue: CueSheet
+) -> dict[str, Path]:
+    distinct_files: list[str] = []
+    seen: set[str] = set()
+    for track in cue.tracks:
+        name = track.file_name or cue.file_name or ""
+        if name and name not in seen:
+            seen.add(name)
+            distinct_files.append(name)
+
+    audio_paths: dict[str, Path] = {}
     if args.audio:
-        audio_path = Path(args.audio).expanduser().resolve()
-    elif cue.file_name:
-        audio_path = (cue_path.parent / cue.file_name).resolve()
+        override = Path(args.audio).expanduser().resolve()
+        if len(distinct_files) > 1:
+            fail("--audio cannot be used with a multi-file CUE")
+        key = distinct_files[0] if distinct_files else override.name
+        audio_paths[key] = override
+    elif distinct_files:
+        for name in distinct_files:
+            audio_paths[name] = (cue_path.parent / name).resolve()
     else:
-        audio_path = first_audio_file(cue_path.parent)
-        if audio_path is None:
+        guess = first_audio_file(cue_path.parent)
+        if guess is None:
             fail(f"Could not find source audio beside {cue_path}")
+        audio_paths[""] = guess
+        for track in cue.tracks:
+            if not track.file_name:
+                track.file_name = ""
 
-    if not audio_path.exists():
-        fail(f"Source audio file does not exist: {audio_path}")
+    for name, path in audio_paths.items():
+        if not path.exists():
+            fail(f"Source audio file does not exist: {path}")
 
-    return input_dir, cue_path, audio_path
+    return audio_paths
 
 
 def probe_duration(audio_path: Path) -> float:
@@ -307,6 +588,7 @@ def probe_audio_properties(audio_path: Path) -> tuple[int, int]:
 
 
 def sanitize_part(value: str) -> str:
+    value = value.replace("�", "'")
     value = re.sub(r"[/:]+", " - ", value.strip())
     value = re.sub(r'[<>:"\\|?*]', "", value)
     value = re.sub(r"\s+", " ", value).strip().strip(".")
@@ -331,6 +613,7 @@ def dedupe_keep_order(values: Iterable[str]) -> list[str]:
 
 
 def clean_whitespace(value: str) -> str:
+    value = value.replace("�", "'")
     return re.sub(r"\s+", " ", value).strip(" -;,\t")
 
 
@@ -404,10 +687,17 @@ def build_preserved_output_dir(output_root: Path, source_root: Path, input_dir: 
     return output_root / relative
 
 
-def assign_track_boundaries(cue: CueSheet, audio_duration: float) -> None:
-    for idx, track in enumerate(cue.tracks):
-        next_track = cue.tracks[idx + 1] if idx + 1 < len(cue.tracks) else None
-        track.end_seconds = next_track.start_seconds if next_track else audio_duration
+def assign_track_boundaries(cue: CueSheet, file_durations: dict[str, float]) -> None:
+    by_file: dict[str | None, list[Track]] = {}
+    for track in cue.tracks:
+        by_file.setdefault(track.file_name, []).append(track)
+    for file_name, group in by_file.items():
+        duration = file_durations.get(file_name or "", 0.0)
+        for idx, track in enumerate(group):
+            if idx + 1 < len(group):
+                track.end_seconds = group[idx + 1].start_seconds
+            else:
+                track.end_seconds = duration
 
 
 def codec_settings(fmt: str) -> tuple[str, list[str]]:
@@ -428,8 +718,28 @@ def apple_alac_cap_filter_args(sample_rate: int, bit_depth: int) -> list[str]:
     return ["-af", f"aformat=sample_fmts={target_fmt}:sample_rates={target_rate}"]
 
 
+_LEADING_TRACKNUM_RE = re.compile(r"^(\d{1,3})[.\-_)\s]+(?=\S)")
+
+
+def strip_redundant_track_prefix(title: str, expected_number: int) -> str:
+    if not title:
+        return title
+    match = _LEADING_TRACKNUM_RE.match(title)
+    if not match:
+        return title
+    try:
+        leading = int(match.group(1))
+    except ValueError:
+        return title
+    if leading != expected_number:
+        return title
+    stripped = title[match.end():].strip()
+    return stripped or title
+
+
 def format_track_filename(track_number: int, title: str, ext: str) -> str:
-    return f"{track_number:02d} - {sanitize_part(title or f'Track {track_number:02d}')}{ext}"
+    cleaned = strip_redundant_track_prefix(title or "", track_number)
+    return f"{track_number:02d} - {sanitize_part(cleaned or f'Track {track_number:02d}')}{ext}"
 
 
 def build_ffmpeg_command(
@@ -474,14 +784,14 @@ def build_ffmpeg_command(
     return cmd
 
 
-def main() -> None:
-    args = parse_args()
-    if args.apple_library:
-        args.format = "alac"
-        if not args.output_root:
-            args.output_root = DEFAULT_APPLE_OUTPUT_ROOT
-    input_dir, cue_path, audio_path = resolve_paths(args)
+def process_cue(
+    args: argparse.Namespace,
+    input_dir: Path,
+    cue_path: Path,
+    output_subdir: str | None,
+) -> None:
     cue = parse_cue(cue_path)
+    audio_paths = resolve_audio_for_cue(args, cue_path, cue)
 
     if args.album_artist:
         cue.performer = args.album_artist
@@ -497,7 +807,8 @@ def main() -> None:
     if not cue.performer:
         cue.performer = "Unknown Artist"
     if not cue.title:
-        cue.title = audio_path.stem
+        first_path = next(iter(audio_paths.values()))
+        cue.title = first_path.stem
     if args.normalize_tags or args.apple_library:
         cue = normalize_cue_fields(cue)
 
@@ -509,14 +820,26 @@ def main() -> None:
         output_dir = build_preserved_output_dir(output_root, source_root, input_dir)
     else:
         output_dir = build_output_dir(output_root, cue.performer, cue.date, cue.title)
-    cover_art = find_cover_art(cue_path.parent)
-    duration = probe_duration(audio_path)
-    sample_rate, bit_depth = probe_audio_properties(audio_path)
-    assign_track_boundaries(cue, duration)
+    if output_subdir:
+        output_dir = output_dir / sanitize_part(output_subdir)
+    cover_art = find_cover_art(cue_path.parent, disc_hint=output_subdir)
+
+    file_durations: dict[str, float] = {}
+    file_props: dict[str, tuple[int, int]] = {}
+    for name, path in audio_paths.items():
+        file_durations[name] = probe_duration(path)
+        file_props[name] = probe_audio_properties(path)
+    assign_track_boundaries(cue, file_durations)
     ext, _codec_args = codec_settings(args.format)
 
     print(f"CUE:        {cue_path}")
-    print(f"SOURCE:     {audio_path}")
+    if len(audio_paths) == 1:
+        only_path = next(iter(audio_paths.values()))
+        print(f"SOURCE:     {only_path}")
+    else:
+        print(f"SOURCES:    {len(audio_paths)} files")
+        for name, path in audio_paths.items():
+            print(f"  - {path}")
     print(f"FORMAT:     {args.format}")
     print(f"OUTPUT DIR: {output_dir}")
     if cover_art:
@@ -526,6 +849,12 @@ def main() -> None:
         output_dir.mkdir(parents=True, exist_ok=True)
 
     for track in cue.tracks:
+        file_name = track.file_name or ""
+        audio_path = audio_paths.get(file_name)
+        if audio_path is None:
+            fail(f"Track {track.number:02d} references unknown source FILE: {file_name!r}")
+        sample_rate, bit_depth = file_props[file_name]
+        duration = file_durations[file_name]
         track_artist = track.performer or cue.performer
         track_title = track.title or f"Track {track.number:02d}"
         output_path = output_dir / format_track_filename(track.number, track_title, ext)
@@ -560,7 +889,9 @@ def main() -> None:
             print(f"  CMD: {shell_preview(cmd)}")
             continue
 
-        result = run(cmd)
+        track_duration = max(0.0, (track.end_seconds or duration) - (track.start_seconds or 0.0))
+        label = f"[{track.number:02d}] {track_title}"
+        result = run_ffmpeg_with_progress(cmd, track_duration, label)
         if result.returncode != 0:
             fail(
                 f"ffmpeg failed for track {track.number:02d}",
@@ -568,6 +899,77 @@ def main() -> None:
             )
 
     print("\nDone.")
+    return output_dir
+
+
+def copy_artwork(src_folder: Path, dest_dir: Path, *, dry_run: bool, force: bool) -> None:
+    """Copy artwork dirs (Covers/Artwork/...) and loose root images into dest_dir as-is."""
+    try:
+        entries = sorted(src_folder.iterdir())
+    except OSError:
+        return
+    items: list[Path] = []
+    for p in entries:
+        try:
+            if p.is_dir() and p.name.lower() in COVER_SUBDIRS:
+                items.append(p)
+            elif p.is_file() and p.suffix.lower() in COVER_EXTS:
+                items.append(p)
+        except OSError:
+            continue
+    for src in items:
+        dst = dest_dir / src.name
+        print(f"COPY ART:   {src} -> {dst}")
+        if dry_run:
+            continue
+        if dst.exists() and not force:
+            continue
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        if src.is_dir():
+            shutil.copytree(src, dst, dirs_exist_ok=True)
+        else:
+            shutil.copy2(src, dst)
+
+
+def main() -> None:
+    args = parse_args()
+    if args.apple_library:
+        args.format = "alac"
+        if not args.output_root:
+            args.output_root = DEFAULT_APPLE_OUTPUT_ROOT
+
+    input_dir = resolve_input_dir(args)
+    cue_paths, multi_disc = select_cue_paths(args, input_dir)
+
+    if multi_disc:
+        print(f"Multi-disc box: {len(cue_paths)} discs in {input_dir}")
+
+    failures = 0
+    produced_dirs: list[Path] = []
+    for cue_path in cue_paths:
+        output_subdir = cue_path.stem if multi_disc else None
+        if multi_disc:
+            print(f"\n=== Disc: {cue_path.name} -> {output_subdir}/ ===")
+        try:
+            produced_dirs.append(process_cue(args, input_dir, cue_path, output_subdir))
+        except SystemExit:
+            if not multi_disc:
+                raise
+            print(f"ERROR: failed on {cue_path.name}", file=sys.stderr)
+            failures += 1
+
+    if args.copy_artwork:
+        if args.preserve_structure:
+            output_root = choose_output_root(input_dir, args.output_root)
+            source_root = Path(args.source_root).expanduser().resolve()
+            base = build_preserved_output_dir(output_root, source_root, input_dir)
+            copy_artwork(input_dir, base, dry_run=args.dry_run, force=args.force)
+        else:
+            for dest in dict.fromkeys(produced_dirs):
+                copy_artwork(input_dir, dest, dry_run=args.dry_run, force=args.force)
+
+    if failures:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
