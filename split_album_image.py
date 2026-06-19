@@ -743,9 +743,11 @@ def build_preserved_output_dir(output_root: Path, source_root: Path, input_dir: 
         relative = input_dir.relative_to(source_root)
     except ValueError:
         fail(f"Input directory {input_dir} is not inside source root {source_root}")
-    parts = list(relative.parts)
+    # Normalize every component, not just the leaf: with multi-disc layouts the
+    # year-bearing album folder is a parent of the actual input dir (e.g.
+    # ".../1996. Концерт/CD 1"), so the leaf alone would miss it.
+    parts = [normalize_year_prefix(part) for part in relative.parts]
     if parts:
-        parts[-1] = normalize_year_prefix(parts[-1])
         return output_root.joinpath(*parts)
     return output_root / relative
 
