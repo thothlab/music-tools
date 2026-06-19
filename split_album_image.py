@@ -715,19 +715,24 @@ def build_output_dir(root: Path, album_artist: str, year: str, album_title: str)
 
 # A leading release year (1900-2099) followed by a non-digit, e.g. "1994. Title".
 _YEAR_PREFIX_RE = re.compile(r"^((?:19|20)\d{2})(\D.*)$", re.DOTALL)
+# Separator chars stripped between the year and the title (incl. comma).
+_YEAR_SEP_CHARS = " \t.,_-–—"
 
 
 def normalize_year_prefix(name: str) -> str:
-    """Normalize ``"1994. Title"`` / ``"1994 Title"`` -> ``"1994 - Title"``.
+    """Normalize ``"1994. Title"`` / ``"1994, Title"`` / ``"1994 Title"`` -> ``"1994 - Title"``.
 
     Only touches a leading 4-digit year that is not already separated from the
-    title by ``" - "``; the title itself (its own dots, commas, ...) is kept.
+    title by ``" - "``; only the *leading* separator is replaced, so the title's
+    own dots and commas are kept.
     """
     match = _YEAR_PREFIX_RE.match(name)
     if not match:
         return name
     year, rest = match.group(1), match.group(2)
-    title = rest.lstrip(" .-_–—\t")
+    if rest[0] not in _YEAR_SEP_CHARS:
+        return name  # year not followed by a recognized separator -> leave as-is
+    title = rest.lstrip(_YEAR_SEP_CHARS)
     if not title:
         return name
     return f"{year} - {title}"
