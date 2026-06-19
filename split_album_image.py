@@ -245,21 +245,50 @@ def parse_mmssff(value: str) -> float:
     return minutes * 60 + seconds + (frames / 75.0)
 
 
+def _legacy_text_score(text: str) -> int:
+    """Higher = more like coherent text. Letters reward, stray high symbols penalize.
+
+    Mojibake (e.g. a Cyrillic cp1251 sheet decoded as cp1252) shows up as a run of
+    high-range symbols/punctuation rather than letters, so it scores low.
+    """
+    letters = symbols = 0
+    for ch in text:
+        if ord(ch) < 0x80:
+            continue
+        if ch.isalpha():
+            letters += 1
+        elif not ch.isspace():
+            symbols += 1
+    return letters - symbols
+
+
 def read_cue_text(cue_path: Path) -> str:
     """Decode a CUE sheet, tolerating the legacy encodings EAC/rippers emit.
 
-    Many CUEs are Windows-1252 rather than UTF-8 (e.g. byte 0x92 for a typographic
-    apostrophe in a FILE name). Reading them as UTF-8 mangles those bytes into
-    U+FFFD and the referenced audio file is never found, so try UTF-8 first and
-    fall back to cp1252, then latin-1 (which maps every byte).
+    Genuine UTF-8 (incl. BOM) is authoritative. Otherwise the sheet is a legacy
+    single-byte codepage — usually cp1251 (Russian) or cp1252 (Western). Both
+    decode almost any byte without error, so we decode with each and keep the
+    result that looks most like real text, breaking ties toward cp1252 so a lone
+    Western accent is not misread as Cyrillic. latin-1 maps every byte as a final
+    safety net.
     """
     raw = cue_path.read_bytes()
-    for encoding in ("utf-8-sig", "cp1252", "latin-1"):
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        pass
+    best: tuple[int, str] | None = None
+    for encoding in ("cp1252", "cp1251"):
         try:
-            return raw.decode(encoding)
+            text = raw.decode(encoding)
         except UnicodeDecodeError:
             continue
-    return raw.decode("utf-8", errors="replace")
+        score = _legacy_text_score(text)
+        if best is None or score > best[0]:
+            best = (score, text)
+    if best is not None:
+        return best[1]
+    return raw.decode("latin-1")
 
 
 def parse_cue(cue_path: Path) -> CueSheet:
