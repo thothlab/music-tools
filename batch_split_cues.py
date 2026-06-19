@@ -10,6 +10,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from split_album_image import _cue_references_existing_audio
+
 TRACK_AUDIO_EXTS = {".flac", ".m4a", ".wv", ".ape", ".wav", ".aiff", ".aif", ".alac"}
 CUE_FILE_LINE_RE = re.compile(r'^\s*FILE\s+"?(.*?)"?\s+\S+\s*$', re.IGNORECASE)
 
@@ -138,7 +140,20 @@ def main() -> None:
     track_based_cue_dirs: list[Path] = []
     for folder in all_cue_dirs:
         cues = sorted(folder.glob("*.cue"))
+        try:
+            audio_count = sum(
+                1 for p in folder.iterdir()
+                if p.is_file() and p.suffix.lower() in TRACK_AUDIO_EXTS
+            )
+        except OSError:
+            audio_count = 0
         if cues and all(cue_is_track_based(cue) for cue in cues):
+            track_based_cue_dirs.append(folder)
+        elif cues and audio_count >= 2 and not any(
+            _cue_references_existing_audio(cue) for cue in cues
+        ):
+            # Image-style cue whose source file is gone, but the folder already
+            # holds the split per-track files — convert the tracks, ignore the cue.
             track_based_cue_dirs.append(folder)
         else:
             image_cue_dirs.append(folder)
