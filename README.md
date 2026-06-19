@@ -78,7 +78,7 @@ By default:
 - Cover art is detected by scoring image filenames by keyword (`front`, `cover`, `folder`, `album` win; `back`, `booklet`, `matrix`, ... lose) rather than requiring an exact name, so files like `front CD1.jpg` are recognized. Images in `Covers/`, `Artwork/`, `Scans/`, etc. are searched too, and the best match is embedded when possible
 - Multi-disc boxes: a folder holding several disc images (one `cue` + audio per disc, e.g. `CD1.cue`/`CD1.flac`, `CD2.cue`/`CD2.flac`) is split per disc into its own subfolder (`CD1/`, `CD2/`, ...), and each disc gets the cover whose name matches that disc
 - CUE sheets are decoded with a `utf-8-sig -> cp1252 -> latin-1` fallback, so legacy Windows-1252 cues (e.g. byte `0x92` for a typographic apostrophe in a `FILE` name) still resolve their audio on disk
-- `--copy-artwork` copies artwork directories (`Covers/`, `Artwork/`, ...) and loose images into the output as-is, mirroring their source layout (for a multi-disc box, once into the release root next to `CD1/`, `CD2/`, ...)
+- `--copy-artwork` gathers image files from the release root and from any recognized artwork subfolder (`Covers/`, `Art/`, `Artwork/`, `Scans/`, `tiff/`, ...) and copies them into a single `Covers/` folder in the output, flattening the differently-named source folders into one place (for a multi-disc box, once into the release root next to `CD1/`, `CD2/`, ...). Non-image files (logs, `.inf`, ...) are skipped; `.tif/.tiff/.bmp/.gif/.webp` are copied alongside `.jpg/.png`
 - `--apple-library` implies:
   - `--format alac`
   - output root `/Volumes/PHOTOS/Музыка-Apple`

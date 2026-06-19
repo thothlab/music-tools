@@ -28,7 +28,12 @@ SUPPORTED_AUDIO_EXTS = {
     ".alac",
 }
 COVER_EXTS = (".jpg", ".jpeg", ".png")
-COVER_SUBDIRS = ("scan", "scans", "cover", "covers", "artwork", "art", "front")
+COVER_SUBDIRS = (
+    "scan", "scans", "cover", "covers", "artwork", "art", "front",
+    "tiff", "tif", "images", "image", "pics", "pictures",
+)
+# Image formats copied as-is by --copy-artwork (broader than the embeddable set).
+ARTWORK_IMAGE_EXTS = COVER_EXTS + (".tif", ".tiff", ".bmp", ".gif", ".webp")
 # Filename keywords that mark a front-cover candidate, strongest first.
 COVER_POSITIVE_KEYWORDS = (("front", 100), ("cover", 90), ("folder", 85), ("album", 80))
 # Keywords that mark a non-front scan (back, booklet pages, disc matrix, etc.).
@@ -903,32 +908,42 @@ def process_cue(
 
 
 def copy_artwork(src_folder: Path, dest_dir: Path, *, dry_run: bool, force: bool) -> None:
-    """Copy artwork dirs (Covers/Artwork/...) and loose root images into dest_dir as-is."""
+    """Consolidate artwork images into a single ``Covers/`` folder in the output.
+
+    Image files from the release root and from any recognised artwork subfolder
+    (``Covers``/``Art``/``Artwork``/``Scans``/``tiff``/...) are gathered and
+    copied into ``<dest_dir>/Covers``, flattening the differently-named source
+    folders into one place.
+    """
     try:
         entries = sorted(src_folder.iterdir())
     except OSError:
         return
-    items: list[Path] = []
+    images: list[Path] = []
     for p in entries:
         try:
-            if p.is_dir() and p.name.lower() in COVER_SUBDIRS:
-                items.append(p)
-            elif p.is_file() and p.suffix.lower() in COVER_EXTS:
-                items.append(p)
+            if p.is_file() and p.suffix.lower() in ARTWORK_IMAGE_EXTS:
+                images.append(p)
+            elif p.is_dir() and p.name.lower() in COVER_SUBDIRS:
+                images += [
+                    q for q in sorted(p.rglob("*"))
+                    if q.is_file() and q.suffix.lower() in ARTWORK_IMAGE_EXTS
+                ]
         except OSError:
             continue
-    for src in items:
-        dst = dest_dir / src.name
+    if not images:
+        return
+
+    covers_dir = dest_dir / "Covers"
+    for src in images:
+        dst = covers_dir / src.name
         print(f"COPY ART:   {src} -> {dst}")
         if dry_run:
             continue
         if dst.exists() and not force:
             continue
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        if src.is_dir():
-            shutil.copytree(src, dst, dirs_exist_ok=True)
-        else:
-            shutil.copy2(src, dst)
+        covers_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
 
 
 def main() -> None:
