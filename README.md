@@ -75,7 +75,10 @@ By default:
 - It uses lossless encoding only:
   - `flac` -> `.flac`
   - `alac` -> `.m4a`
-- If a `cover.jpg`, `cover.png`, `folder.jpg`, or `folder.png` exists beside the source, the script embeds it in the output files when possible
+- Cover art is detected by scoring image filenames by keyword (`front`, `cover`, `folder`, `album` win; `back`, `booklet`, `matrix`, ... lose) rather than requiring an exact name, so files like `front CD1.jpg` are recognized. Images in `Covers/`, `Artwork/`, `Scans/`, etc. are searched too, and the best match is embedded when possible
+- Multi-disc boxes: a folder holding several disc images (one `cue` + audio per disc, e.g. `CD1.cue`/`CD1.flac`, `CD2.cue`/`CD2.flac`) is split per disc into its own subfolder (`CD1/`, `CD2/`, ...), and each disc gets the cover whose name matches that disc
+- CUE sheets are decoded with a `utf-8-sig -> cp1252 -> latin-1` fallback, so legacy Windows-1252 cues (e.g. byte `0x92` for a typographic apostrophe in a `FILE` name) still resolve their audio on disk
+- `--copy-artwork` copies artwork directories (`Covers/`, `Artwork/`, ...) and loose images into the output as-is, mirroring their source layout (for a multi-disc box, once into the release root next to `CD1/`, `CD2/`, ...)
 - `--apple-library` implies:
   - `--format alac`
   - output root `/Volumes/PHOTOS/Музыка-Apple`
@@ -133,6 +136,15 @@ python3 music-tools/batch_split_cues.py \
   --preserve-structure
 ```
 
+Also copy artwork folders/images alongside the converted tracks:
+
+```bash
+python3 music-tools/batch_split_cues.py \
+  --root "/Volumes/PHOTOS/Музыка" \
+  --apple-library \
+  --copy-artwork
+```
+
 In this mode:
 
 ```text
@@ -163,6 +175,7 @@ Small wrapper command for the default workflow.
 
 - If called without arguments, it processes the current directory
 - If called with one argument, it treats it as the source root
+- Any extra flags are forwarded to `batch_split_cues.py`
 - Uses the default Apple workflow:
   - `--apple-library`
   - `--copy-non-cue-alac`
@@ -172,4 +185,5 @@ Example:
 ```bash
 music-apple
 music-apple "/Volumes/PHOTOS/Музыка"
+music-apple "/Volumes/PHOTOS/Музыка" --copy-artwork
 ```
