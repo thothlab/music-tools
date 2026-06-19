@@ -157,6 +157,19 @@ becomes:
 /Volumes/PHOTOS/Музыка-Apple/Artist/Album
 ```
 
+### Failure report
+
+If any releases fail (bad cue, missing/locked audio, no access, ...), the run
+continues and prints the list of failed folders at the end, tagged by stage
+(`[CUE]` / `[TRACK]`), then exits non-zero — so you can see exactly what needs
+a second pass:
+
+```text
+Finished with 2 failure(s):
+  [CUE] /Volumes/PHOTOS/Музыка/Artist/Some Broken Album
+  [TRACK] /Volumes/PHOTOS/Музыка/Artist/Another Folder
+```
+
 ## convert_track_album.py
 
 Convert an already track-based album folder into `ALAC`, preserving tags and embedded or sidecar artwork where possible.

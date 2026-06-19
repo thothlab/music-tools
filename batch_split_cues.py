@@ -143,7 +143,7 @@ def main() -> None:
         else:
             image_cue_dirs.append(folder)
 
-    failures = 0
+    failed: list[tuple[str, Path]] = []
     processed = 0
     limit = args.limit if args.limit > 0 else None
 
@@ -178,7 +178,7 @@ def main() -> None:
         result = run_child(cmd)
         processed += 1
         if result.returncode != 0:
-            failures += 1
+            failed.append(("CUE", folder))
 
     if args.copy_non_cue_alac and (limit is None or processed < limit):
         cue_dir_set = set(all_cue_dirs)
@@ -224,10 +224,12 @@ def main() -> None:
             result = run_child(cmd)
             processed += 1
             if result.returncode != 0:
-                failures += 1
+                failed.append(("TRACK", folder))
 
-    if failures:
-        print(f"\nFinished with {failures} failure(s).", file=sys.stderr)
+    if failed:
+        print(f"\nFinished with {len(failed)} failure(s):", file=sys.stderr)
+        for kind, folder in failed:
+            print(f"  [{kind}] {folder}", file=sys.stderr)
         raise SystemExit(1)
 
     print("\nDone.")
