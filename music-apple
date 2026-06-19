@@ -21,4 +21,5 @@ exec python3 "$SCRIPT_DIR/batch_split_cues.py" \
   --root "$ROOT_DIR" \
   --apple-library \
   --copy-non-cue-alac \
+  --copy-artwork \
   "$@"

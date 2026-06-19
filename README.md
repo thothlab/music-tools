@@ -179,6 +179,7 @@ Small wrapper command for the default workflow.
 - Uses the default Apple workflow:
   - `--apple-library`
   - `--copy-non-cue-alac`
+  - `--copy-artwork`
 
 Example:
 
