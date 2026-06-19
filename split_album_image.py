@@ -713,11 +713,35 @@ def build_output_dir(root: Path, album_artist: str, year: str, album_title: str)
     return root / album_artist_dir / album_stub
 
 
+# A leading release year (1900-2099) followed by a non-digit, e.g. "1994. Title".
+_YEAR_PREFIX_RE = re.compile(r"^((?:19|20)\d{2})(\D.*)$", re.DOTALL)
+
+
+def normalize_year_prefix(name: str) -> str:
+    """Normalize ``"1994. Title"`` / ``"1994 Title"`` -> ``"1994 - Title"``.
+
+    Only touches a leading 4-digit year that is not already separated from the
+    title by ``" - "``; the title itself (its own dots, commas, ...) is kept.
+    """
+    match = _YEAR_PREFIX_RE.match(name)
+    if not match:
+        return name
+    year, rest = match.group(1), match.group(2)
+    title = rest.lstrip(" .-_–—\t")
+    if not title:
+        return name
+    return f"{year} - {title}"
+
+
 def build_preserved_output_dir(output_root: Path, source_root: Path, input_dir: Path) -> Path:
     try:
         relative = input_dir.relative_to(source_root)
     except ValueError:
         fail(f"Input directory {input_dir} is not inside source root {source_root}")
+    parts = list(relative.parts)
+    if parts:
+        parts[-1] = normalize_year_prefix(parts[-1])
+        return output_root.joinpath(*parts)
     return output_root / relative
 
 
